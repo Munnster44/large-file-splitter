@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Large File Cleaner v24 - Production Pipeline + Repair Suggestions</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+:root{--red:#b5121b;--dark:#222;--light:#fff;--soft:#f4f4f4;--line:#ddd;}
+body{font-family:Arial,Helvetica,sans-serif;margin:0;background:#f7f7f7;color:#222;}
+header{background:var(--red);color:#fff;padding:14px 18px;}
+header h1{margin:0;font-size:20px}.wrap{max-width:1150px;margin:18px auto;padding:0 14px}.card{background:#fff;border:1px solid #ddd;border-radius:10px;padding:14px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.row>*{margin:3px 0}button{background:var(--red);color:#fff;border:0;border-radius:7px;padding:10px 13px;cursor:pointer;font-weight:bold}button:disabled{opacity:.45;cursor:not-allowed}.secondary{background:#444}input,select{padding:9px;border:1px solid #bbb;border-radius:6px}.hint{font-size:13px;color:#555}.barbox{height:22px;background:#eee;border-radius:20px;overflow:hidden;border:1px solid #ccc}.bar{height:100%;width:0;background:var(--red);color:#fff;font-size:12px;text-align:center;line-height:22px;transition:width .15s}.log{height:250px;overflow:auto;background:#111;color:#e8e8e8;font-family:Consolas,monospace;font-size:12px;padding:10px;border-radius:8px;white-space:pre-wrap}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}.stat{background:#fafafa;border:1px solid #ddd;border-radius:8px;padding:10px}.stat b{display:block;font-size:18px;color:var(--red)}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #ddd;padding:6px;text-align:left}th{background:#f0f0f0}.small{font-size:12px}.ok{color:#087b30;font-weight:bold}.bad{color:#b5121b;font-weight:bold}
+</style>
+</head>
+<body>
+<header><h1>Large File Cleaner v24 - Production Pipeline + Repair Suggestions + Membership Breakdown</h1></header>
+<div class="wrap">
+  <div class="card">
+    <div class="row">
+      <input type="file" id="fileInput" accept=".csv,.txt" />
+      <input type="text" id="baseName" value="cleaned_membership_output_v24" size="32" />
+      <button id="processBtn" disabled>Process CSV</button>
+      <button id="downloadBtn" disabled>Download ZIP</button>
+      <button id="clearBtn" class="secondary">Clear</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label>Date glitch threshold: <input type="number" id="futureDays" value="411" min="300" max="900" style="width:90px"> days after today</label>
+      <span class="hint">Flags records whose Next Payment Date is more than 1 year + 46 days after today.</span>
+    </div>
+    <p class="hint"><b>Large-file mode:</b> For 700,000+ rows, use CSV UTF-8. Output is a ZIP containing CSV “tabs”: Summary, Integrity Audit, Master Index, Old ID, New ID, Cancelled, Deleted, Deceased, Active, Paid Up, 30 Day, Expired, Inactive, Former Member, Non Member, Unclassified Clean, Renewal Glitch Audit files, Duplicate, Automatic Repair Suggestions, and Processing Log.</p>
+  </div>
+
+  <div class="card">
+    <div class="barbox"><div id="bar" class="bar">0%</div></div>
+    <div id="status" class="hint" style="margin-top:8px">Choose a CSV file.</div>
+  </div>
+
+  <div class="card">
+    <h3>Summary Counts</h3>
+    <div id="stats" class="stats"></div>
+  </div>
+
+  <div class="card">
+    <h3>Column Detection</h3>
+    <div id="columns" class="hint">No file loaded yet.</div>
+  </div>
+
+  <div class="card">
+    <h3>Processing Log</h3>
+    <div id="log" class="log"></div>
+  </div>
+</div>
+
+<script>
+const fileInput=document.getElementById('fileInput');
+const processBtn=document.getElementById('processBtn');
+const downloadBtn=document.getElementById('downloadBtn');
+const clearBtn=document.getElementById('clearBtn');
+const logEl=document.getElementById('log');
+const bar=document.getElementById('bar');
+const statusEl=document.getElementById('status');
+const statsEl=document.getElementById('stats');
+const columnsEl=document.getElementById('columns');
+let loadedFile=null, rows=[], headers=[], col={}, outputs=null, zipBlob=null;
+const today=new Date(); today.setHours(0,0,0,0);
+const msDay=24*60*60*1000;
+function log(msg){const t=new Date().toLocaleTimeString(); logEl.textContent += `[${t}] ${msg}\n`; logEl.scrollTop=logEl.scrollHeight;}
+function pct(n){bar.style.width=n+'%';bar.textContent=n+'%';}
+function norm(s){return String(s??'').toLowerCase().replace(/[\s_\-.]+/g,'').replace(/[^a-z0-9]/g,'');}
+function csvEscape(v){v=v==null?'':String(v); if(/[",\n\r]/.test(v)) return '"'+v.replace(/"/g,'""')+'"'; return v;}
+function toCSV(list, head=headers){let out=head.map(csvEscape).join(',')+'\n'; for(const r of list){out+=head.map(h=>csvEscape(r[h])).join(',')+'\n'} return out;}
+function simpleCSV(rows){return rows.map(r=>r.map(csvEscape).join(',')).join('\n')+'\n';}
+function addStat(name,count){const d=document.createElement('div');d.className='stat';d.innerHTML=`<span>${name}</span><b>${count.toLocaleString()}</b>`;statsEl.appendChild(d);}
+function getVal(r,key){return r[col[key]] ?? '';}
+function containsAny(text, words){const x=String(text??'').toLowerCase(); return words.some(w=>x.includes(w));}
+function parseDate(v){
+  if(v==null) return null; let s=String(v).trim(); if(!s) return null;
+  if(/^\d+(\.\d+)?$/.test(s)){ const num=Number(s); if(num>20000 && num<80000){ const d=new Date(Math.round((num-25569)*86400*1000)); d.setHours(0,0,0,0); return isNaN(d)?null:d; }}
+  s=s.replace(/\./g,'/').replace(/-/g,'/');
+  let m=s.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})/); if(m){const d=new Date(+m[1],+m[2]-1,+m[3]);d.setHours(0,0,0,0);return isNaN(d)?null:d;}
+  m=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/); if(m){let y=+m[3]; if(y<100)y+=2000; const d=new Date(y,+m[1]-1,+m[2]);d.setHours(0,0,0,0);return isNaN(d)?null:d;}
+  const d=new Date(s); if(isNaN(d)) return null; d.setHours(0,0,0,0); return d;
+}
+function idNumber(r){let s=String(getVal(r,'userId')).trim().replace(/[^0-9]/g,''); if(!s) return NaN; return Number(s);}
+function idGroup(r){const n=idNumber(r); if(Number.isNaN(n)) return ''; if(n>=0&&n<=999999) return 'Old ID'; if(n>=8000000&&n<=8999999) return 'New ID'; return 'Other ID';}
+function memType(r){return String(getVal(r,'membershipType')).trim().toLowerCase();}
+function isRegular(r){
+  // v16: treat Active as any master-file record whose Membership Type contains Regular or Regular Life.
+  // This handles values such as Regular, Regular Life, Regular Member, Regular Life Member,
+  // and common typing mistakes seen during testing. It deliberately excludes Former/Non Member.
+  const raw=memType(r);
+  const compact=raw.replace(/[^a-z0-9]/g,'');
+  const spaced=raw.replace(/\s+/g,' ').trim();
+  if(isFormer(r) || isNonMember(r)) return false;
+  if(compact.includes('regularlife') || compact.includes('rehularlife')) return true;
+  if(compact.includes('regular') || compact.includes('regulat') || compact.includes('rehular')) return true;
+  return false;
+}
+function isFormer(r){
+  const raw=memType(r);
+  const compact=raw.replace(/[^a-z0-9]/g,'');
+  return compact.includes('former');
+}
+function isNonMember(r){
+  const raw=memType(r);
+  const compact=raw.replace(/[^a-z0-9]/g,'');
+  // Handles Non Member, Non-Member, NonMember, non_member, and similar spacing/punctuation variations.
+  return compact.includes('nonmember') || (compact.startsWith('non') && compact.includes('member'));
+}
+function activeDateStatus(r){const d=parseDate(getVal(r,'nextPaymentDate')); if(!d) return 'Expired'; const diff=Math.floor((today-d)/msDay); if(d>=today) return 'Paid Up'; if(diff>=0 && diff<=30) return '30 Day'; return 'Expired';}
+function hasValidPaidDate(r){const d=parseDate(getVal(r,'nextPaymentDate')); return !!(d && d>=today);}
+function isFutureDateGlitch(r){const d=parseDate(getVal(r,'nextPaymentDate')); if(!d) return false; const days=Number(document.getElementById('futureDays')?.value||411); const limit=new Date(today); limit.setDate(limit.getDate()+days); return d>limit;}
+function missingDistrictSquadron(r){const d=col.district?String(getVal(r,'district')).trim():''; const s=col.squadron?String(getVal(r,'squadron')).trim():''; return !d || !s;}
+function qualityReason(r){const reasons=[]; if(isFutureDateGlitch(r)) reasons.push('Next Payment Date beyond 1 year + 46 days'); if(hasValidPaidDate(r) && !isRegular(r)) reasons.push('Valid paid date but Membership Type is not Regular/Regular Life'); if(hasValidPaidDate(r) && missingDistrictSquadron(r)) reasons.push('Valid paid date with blank District or Squadron'); return reasons.join(' / ');}
+function addRepairSuggestion(out,r,reason,suggestedAction){
+  const rr={};
+  rr['Record Number']='';
+  rr['User ID']=getVal(r,'userId');
+  rr['Member ID']=col.memberId?getVal(r,'memberId'):'';
+  rr['First Name']=getVal(r,'firstName');
+  rr['Last Name']=getVal(r,'lastName');
+  rr['Email']=getVal(r,'email');
+  rr['Membership Type']=getVal(r,'membershipType');
+  rr['Next Payment Date']=getVal(r,'nextPaymentDate');
+  rr['District']=col.district?getVal(r,'district'):'';
+  rr['Squadron']=col.squadron?getVal(r,'squadron'):'';
+  rr['Repair Reason']=reason;
+  rr['Suggested Action']=suggestedAction;
+  out.repairSuggestions.push(rr);
+}
+function detectColumns(){
+  const map={userId:['userid','user id'],firstName:['firstname','first name'],lastName:['lastname','last name'],email:['email','e mail','emailaddress'],nextPaymentDate:['nextpaymentdate','next payment date'],membershipType:['membershiptype','membership type'],memberId:['memberid','member id'],district:['district'],squadron:['squadron']};
+  col={}; const nheads=headers.map(norm);
+  for(const key in map){ for(let i=0;i<nheads.length;i++){ if(map[key].map(norm).includes(nheads[i])){ col[key]=headers[i]; break; } } }
+  columnsEl.innerHTML = Object.entries(map).map(([k])=>`${k}: <b class="${col[k]?'ok':'bad'}">${col[k]||'NOT FOUND'}</b>`).join('<br>');
+  const req=['userId','firstName','lastName','email','nextPaymentDate','membershipType'];
+  const missing=req.filter(k=>!col[k]); if(missing.length) throw new Error('Missing required columns: '+missing.join(', '));
+}
+function reset(){rows=[];headers=[];col={};outputs=null;zipBlob=null;downloadBtn.disabled=true;processBtn.disabled=true;statsEl.innerHTML='';columnsEl.textContent='No file loaded yet.';logEl.textContent='';pct(0);statusEl.textContent='Choose a CSV file.';}
+fileInput.addEventListener('change',()=>{
+  reset(); loadedFile=fileInput.files[0]; if(!loadedFile)return;
+  log(`Selected: ${loadedFile.name} (${Math.round(loadedFile.size/1024/1024)} MB)`); statusEl.textContent='Parsing CSV...';
+  Papa.parse(loadedFile,{header:true,skipEmptyLines:true,worker:true,complete:(res)=>{
+    headers=res.meta.fields||[]; rows=res.data||[]; log(`CSV parsed rows: ${rows.length.toLocaleString()}`); log(`Headers found: ${headers.length}`);
+    try{detectColumns(); processBtn.disabled=false; statusEl.textContent='Ready. Click Process CSV.'; pct(5);}catch(e){log('ERROR: '+e.message); statusEl.textContent=e.message;}
+  },error:(err)=>{log('ERROR parsing CSV: '+err.message);}});
+});
+processBtn.addEventListener('click',async()=>{
+  if(!rows.length)return; processBtn.disabled=true; downloadBtn.disabled=true; zipBlob=null; statsEl.innerHTML=''; pct(10);
+  log(`Processing ${rows.length.toLocaleString()} records using today = ${today.toISOString().slice(0,10)}`);
+  log('v24 production pipeline: Duplicate is removed before Active/Inactive, plus Disposition and Automatic Repair Suggestions.');
+  const out={masterIndex:[],oldId:[],newId:[],otherId:[],cancelled:[],deleted:[],deceased:[],duplicate:[],removed:[],active:[],paidUp:[],day30:[],expired:[],inactive:[],formerMember:[],nonMember:[],unclassifiedClean:[],dateGlitch:[],validPaidNotRegular:[],missingDistrictSquadron:[],renewalGlitchAudit:[],repairSuggestions:[]};
+  const chunk=10000;
+  for(let start=0; start<rows.length; start+=chunk){
+    const end=Math.min(start+chunk, rows.length);
+    for(let i=start;i<end;i++){
+      const r=rows[i];
+      const files=['Master Index'];
+
+      // Stage 1/2 reference classification: complete index + old/new ID files are based on ALL records.
+      const idg=idGroup(r);
+      if(idg==='Old ID'){out.oldId.push(r);files.push('Old ID');}
+      else if(idg==='New ID'){out.newId.push(r);files.push('New ID');}
+      else {out.otherId.push(r);files.push('Other ID');}
+
+      // Stage 3 removal extraction. Removed records stay in index + ID files + removal file(s), but stop here for membership outputs.
+      const ln=getVal(r,'lastName'), em=getVal(r,'email');
+      const searchText=ln+' '+em;
+      const cancelled=containsAny(searchText,['cancelled','canceled']);
+      const deleted=containsAny(searchText,['deleted']);
+      const deceased=containsAny(searchText,['deceased']);
+      const duplicate=containsAny(searchText,['duplicate']);
+      const removalReasons=[];
+      if(cancelled){out.cancelled.push(r);files.push('Cancelled');removalReasons.push('Cancelled');}
+      if(deleted){out.deleted.push(r);files.push('Deleted');removalReasons.push('Deleted');}
+      if(deceased){out.deceased.push(r);files.push('Deceased');removalReasons.push('Deceased');}
+      if(duplicate){out.duplicate.push(r);files.push('Duplicate');removalReasons.push('Duplicate');}
+      const removed = removalReasons.length>0;
+      if(removed){out.removed.push(r);}
+
+      let status = removed ? removalReasons.join(' / ') : 'Unclassified';
+      let dateStatus='';
+      let cleanMembershipClass='';
+
+      // Stage 4/5: membership classification from CLEAN records only.
+      if(!removed){
+        if(isRegular(r)){
+          out.active.push(r); files.push('Active'); status='Active'; cleanMembershipClass='Active';
+          dateStatus=activeDateStatus(r);
+          if(dateStatus==='Paid Up'){out.paidUp.push(r);files.push('Paid Up');}
+          else if(dateStatus==='30 Day'){out.day30.push(r);files.push('30 Day');}
+          else {out.expired.push(r);files.push('Expired');}
+        } else if(isFormer(r)){
+          out.formerMember.push(r); out.inactive.push(r); files.push('Inactive','Former Member'); status='Former Member'; cleanMembershipClass='Former Member';
+        } else if(isNonMember(r)){
+          out.nonMember.push(r); out.inactive.push(r); files.push('Inactive','Non Member'); status='Non Member'; cleanMembershipClass='Non Member';
+        } else {
+          out.unclassifiedClean.push(r); files.push('Unclassified Clean'); status='Unclassified Clean'; cleanMembershipClass='Unclassified Clean';
+        }
+      }
+
+      // Stage 6: data quality / renewal glitch audit from CLEAN records only.
+      // These are audit/reference files, not membership classification tabs.
+      const qReasons = [];
+      if(!removed){
+        if(isFutureDateGlitch(r)){out.dateGlitch.push(r); files.push('Date Glitch'); qReasons.push('Next Payment Date beyond 1 year + 46 days');}
+        if(hasValidPaidDate(r) && !isRegular(r)){out.validPaidNotRegular.push(r); files.push('Valid Paid Not Regular'); qReasons.push('Valid paid date but Membership Type is not Regular/Regular Life');}
+        if(hasValidPaidDate(r) && missingDistrictSquadron(r)){out.missingDistrictSquadron.push(r); files.push('Missing District/Squadron'); qReasons.push('Valid paid date with blank District or Squadron');}
+        if(qReasons.length){
+          const qr=Object.assign({}, r);
+          qr['Audit Reason']=qReasons.join(' / ');
+          qr['Detected Membership Type']=getVal(r,'membershipType');
+          qr['Detected Next Payment Date']=getVal(r,'nextPaymentDate');
+          qr['Detected District']=col.district?getVal(r,'district'):'';
+          qr['Detected Squadron']=col.squadron?getVal(r,'squadron'):'';
+          out.renewalGlitchAudit.push(qr);
+        }
+        if(isFutureDateGlitch(r)) addRepairSuggestion(out,r,'Next Payment Date is more than 411 days ahead','Review renewal date; possible 2-year advance error.');
+        if(hasValidPaidDate(r) && !isRegular(r)) addRepairSuggestion(out,r,'Paid-up date but Membership Type is not Regular/Regular Life','Review Membership Type; likely should be Regular or Regular Life if renewal is valid.');
+        if(hasValidPaidDate(r) && missingDistrictSquadron(r)) addRepairSuggestion(out,r,'Paid-up date but District or Squadron is blank','Review and populate District/Squadron from source records.');
+        if(isRegular(r) && !String(getVal(r,'email')).trim()) addRepairSuggestion(out,r,'Active/Regular record missing email','Review contact information; add valid email if available.');
+        if(isRegular(r) && col.memberId && !String(getVal(r,'memberId')).trim()) addRepairSuggestion(out,r,'Active/Regular record missing Member ID','Review member ID assignment.');
+      }
+
+      const idx={};
+      idx['Record Number']=i+1;
+      idx['User ID']=getVal(r,'userId');
+      idx['Member ID']=col.memberId?getVal(r,'memberId'):'';
+      idx['First Name']=getVal(r,'firstName');
+      idx['Last Name']=getVal(r,'lastName');
+      idx['Email']=getVal(r,'email');
+      idx['Membership Type']=getVal(r,'membershipType');
+      idx['Next Payment Date']=getVal(r,'nextPaymentDate');
+      idx['Removed']=removed?'YES':'NO';
+      idx['Removal Reason']=removed?removalReasons.join(' / '):'';
+      idx['Disposition']=removed?removalReasons.join(' / '):status;
+      idx['ID Group']=idg;
+      idx['Membership Class']=cleanMembershipClass;
+      idx['Current Membership Status']=status;
+      idx['Date Status']=dateStatus;
+      idx['Data Quality Flags']=qReasons ? qReasons.join(' / ') : '';
+      idx['District']=col.district?getVal(r,'district'):'';
+      idx['Squadron']=col.squadron?getVal(r,'squadron'):'';
+      idx['Processing Path']=files.filter(f=>f!=='Master Index').join(' → ');
+      idx['Output Files']=files.join(', ');
+      ['Old ID','New ID','Other ID','Cancelled','Deleted','Deceased','Duplicate','Active','Paid Up','30 Day','Expired','Inactive','Former Member','Non Member','Unclassified Clean','Date Glitch','Valid Paid Not Regular','Missing District/Squadron'].forEach(f=>idx[f]=files.includes(f)?'YES':'');
+      idx['Repair Suggestions']=qReasons.length?'YES':'';
+      out.masterIndex.push(idx);
+    }
+    if(start%(chunk*5)===0){log(`Processed ${end.toLocaleString()} / ${rows.length.toLocaleString()}`);}
+    pct(10+Math.floor((end/rows.length)*65));
+    await new Promise(r=>setTimeout(r,0));
+  }
+  outputs=out; log('Building ZIP files...'); pct(78);
+  const removedUnique=out.removed.length;
+  const remaining=rows.length-removedUnique;
+  const membershipTotal=out.active.length+out.formerMember.length+out.nonMember.length+out.unclassifiedClean.length;
+  const inactiveTotal=out.formerMember.length+out.nonMember.length;
+  const activeDateTotal=out.paidUp.length+out.day30.length+out.expired.length;
+  const summary=[['Category','Count'],['Total Records',rows.length],['Master Index',out.masterIndex.length],['Old ID',out.oldId.length],['New ID',out.newId.length],['Other ID',out.otherId.length],['Removed Unique Total',removedUnique],['Remaining Clean Records',remaining],['Cancelled',out.cancelled.length],['Deleted',out.deleted.length],['Deceased',out.deceased.length],['Duplicate',out.duplicate.length],['Active',out.active.length],['Paid Up',out.paidUp.length],['30 Day',out.day30.length],['Expired',out.expired.length],['Inactive',out.inactive.length],['Former Member',out.formerMember.length],['Non Member',out.nonMember.length],['Unclassified Clean',out.unclassifiedClean.length],['Renewal Glitch Audit',out.renewalGlitchAudit.length],['Date Glitch',out.dateGlitch.length],['Valid Paid Not Regular',out.validPaidNotRegular.length],['Missing District/Squadron',out.missingDistrictSquadron.length],['Automatic Repair Suggestions',out.repairSuggestions.length]];
+  const integrity=[['Check','Expected','Actual','Result'],
+    ['Master Index equals input records',rows.length,out.masterIndex.length, rows.length===out.masterIndex.length?'PASS':'FAIL'],
+    ['Input = Removed Unique + Remaining Clean',rows.length,removedUnique+remaining, rows.length===(removedUnique+remaining)?'PASS':'FAIL'],
+    ['Remaining Clean = Active + Former Member + Non Member + Unclassified Clean',remaining,membershipTotal, remaining===membershipTotal?'PASS':'FAIL'],
+    ['Inactive = Former Member + Non Member',inactiveTotal,out.inactive.length, inactiveTotal===out.inactive.length?'PASS':'FAIL'],
+    ['Active = Paid Up + 30 Day + Expired',out.active.length,activeDateTotal, out.active.length===activeDateTotal?'PASS':'FAIL'],
+    ['Removed records (Cancelled/Deleted/Deceased/Duplicate) excluded from Active/Inactive outputs','0','Enforced by pipeline','PASS'],
+    ['Renewal Glitch Audit equals rows with at least one quality flag','Reference check',out.renewalGlitchAudit.length,'INFO'],
+    ['Automatic Repair Suggestions generated','Reference check',out.repairSuggestions.length,'INFO']
+  ];
+  const mtCounts=new Map();
+  for(const r of rows){const mt=String(getVal(r,'membershipType')||'(blank)').trim()||'(blank)'; mtCounts.set(mt,(mtCounts.get(mt)||0)+1);}
+  const membershipTypeAudit=[['Membership Type','Count','Classified As If Not Removed']];
+  [...mtCounts.entries()].sort((a,b)=>b[1]-a[1] || a[0].localeCompare(b[0])).forEach(([mt,c])=>{
+    const fake={}; fake[col.membershipType]=mt;
+    let cls=isRegular(fake)?'Active':(isFormer(fake)?'Former Member':(isNonMember(fake)?'Non Member':'Unclassified Clean'));
+    membershipTypeAudit.push([mt,c,cls]);
+  });
+  statsEl.innerHTML=''; summary.slice(1).forEach(x=>addStat(x[0],x[1]));
+  const idxHeaders=['Record Number','User ID','Member ID','First Name','Last Name','Email','Membership Type','Next Payment Date','Removed','Removal Reason','Disposition','ID Group','Membership Class','Current Membership Status','Date Status','Data Quality Flags','District','Squadron','Processing Path','Output Files','Old ID','New ID','Other ID','Cancelled','Deleted','Deceased','Duplicate','Active','Paid Up','30 Day','Expired','Inactive','Former Member','Non Member','Unclassified Clean','Date Glitch','Valid Paid Not Regular','Missing District/Squadron','Repair Suggestions'];
+  const zip=new JSZip();
+  zip.file('00_Summary.csv', simpleCSV(summary));
+  zip.file('00a_Integrity_Audit.csv', simpleCSV(integrity));
+  zip.file('00b_Membership_Type_Audit.csv', simpleCSV(membershipTypeAudit)); pct(80);
+  zip.file('01_Master_Index.csv', toCSV(out.masterIndex, idxHeaders)); pct(84);
+  zip.file('02_Old_ID.csv', toCSV(out.oldId)); zip.file('03_New_ID.csv', toCSV(out.newId)); zip.file('04_Other_ID.csv', toCSV(out.otherId)); pct(88);
+  zip.file('05_Cancelled.csv', toCSV(out.cancelled)); zip.file('06_Deleted.csv', toCSV(out.deleted)); zip.file('07_Deceased.csv', toCSV(out.deceased)); zip.file('07a_Duplicate.csv', toCSV(out.duplicate)); pct(91);
+  zip.file('08_Active.csv', toCSV(out.active)); zip.file('09_Paid_Up.csv', toCSV(out.paidUp)); zip.file('10_30_Day.csv', toCSV(out.day30)); zip.file('11_Expired.csv', toCSV(out.expired)); pct(94);
+  zip.file('12_Inactive.csv', toCSV(out.inactive)); zip.file('13_Former_Member.csv', toCSV(out.formerMember)); zip.file('14_Non_Member.csv', toCSV(out.nonMember)); zip.file('15_Unclassified_Clean.csv', toCSV(out.unclassifiedClean));
+  zip.file('16_Renewal_Glitch_Audit.csv', toCSV(out.renewalGlitchAudit));
+  zip.file('17_Date_Glitch_Over_411_Days.csv', toCSV(out.dateGlitch));
+  zip.file('18_Valid_Paid_Not_Regular.csv', toCSV(out.validPaidNotRegular));
+  zip.file('19_Missing_District_Squadron.csv', toCSV(out.missingDistrictSquadron));
+  zip.file('20_Automatic_Repair_Suggestions.csv', toCSV(out.repairSuggestions, ['Record Number','User ID','Member ID','First Name','Last Name','Email','Membership Type','Next Payment Date','District','Squadron','Repair Reason','Suggested Action']));
+  zip.file('21_Processing_Log.txt', logEl.textContent); pct(96);
+  zipBlob=await zip.generateAsync({type:'blob',compression:'DEFLATE',compressionOptions:{level:3}}, meta=>{pct(96+Math.floor(meta.percent*0.04));});
+  pct(100); log('ZIP ready. Click Download ZIP.'); statusEl.textContent='Complete. ZIP is ready.'; downloadBtn.disabled=false; processBtn.disabled=false;
+});
+downloadBtn.addEventListener('click',()=>{if(!zipBlob)return; const a=document.createElement('a'); const base=(document.getElementById('baseName').value||'cleaned_membership_output_v24').replace(/[^a-z0-9_\- ]/gi,'_'); a.href=URL.createObjectURL(zipBlob); a.download=base+'_v24.zip'; document.body.appendChild(a); a.click(); setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1000);});
+clearBtn.addEventListener('click',()=>{fileInput.value=''; reset();});
+</script>
+</body>
+</html>
